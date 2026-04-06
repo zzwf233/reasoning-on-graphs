@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Offline end-to-end benchmark runner:
+# 1) generate RoG planning rules for {RoG-webqsp, RoG-cwq}
+# 2) run predict_answer with {RoG, llama2-chat-hf}
+# 3) collect each run's final metrics into one summary file
+
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%d_%H%M%S)}"
+SPLIT="${SPLIT:-test}"
+N_BEAM="${N_BEAM:-3}"
+
+DATA_PATH="${DATA_PATH:-datasets}"
+ROG_MODEL_PATH="${ROG_MODEL_PATH:-./RoG-model}"
+LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-./Llama-2-7b-chat-hf}"
+
+PROMPT_PATH="${PROMPT_PATH:-prompts/llama2_predict.txt}"
+RESULT_ROOT="${RESULT_ROOT:-results/offline_runs/${RUN_ID}}"
+GEN_ROOT="${RESULT_ROOT}/gen_rule_path"
+PRED_ROOT="${RESULT_ROOT}/KGQA"
+SUMMARY_FILE="${RESULT_ROOT}/summary.tsv"
+GEN_EXTRA_ARGS="${GEN_EXTRA_ARGS:-}"
+PREDICT_EXTRA_ARGS="${PREDICT_EXTRA_ARGS:-}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
+
+GEN_EXTRA_ARGS_ARR=()
+PREDICT_EXTRA_ARGS_ARR=()
+if [[ -n "${GEN_EXTRA_ARGS}" ]]; then
+  read -r -a GEN_EXTRA_ARGS_ARR <<< "${GEN_EXTRA_ARGS}"
+fi
+if [[ -n "${PREDICT_EXTRA_ARGS}" ]]; then
+  read -r -a PREDICT_EXTRA_ARGS_ARR <<< "${PREDICT_EXTRA_ARGS}"
+fi
+
+mkdir -p "${RESULT_ROOT}"
+echo -e "run_id\tdataset\tvariant\tplanning_model\trule_nonempty_pct\trule_path\teval_file\tmetrics" > "${SUMMARY_FILE}"
+
+DATASETS=("RoG-webqsp" "RoG-cwq")
+VARIANTS=("llama_planning_llama_reasoning" "rog_planning_llama_reasoning")
+
+run_predict() {
+  local dataset="$1"
+  local variant="$2"
+  local planning_model="$3"
+  local rule_nonempty_pct="$4"
+  local run_rule_path="$5"
+  local run_pred_root="${PRED_ROOT}/${variant}"
+
+  local cmd=(
+    python src/qa_prediction/predict_answer.py
+    --data_path "${DATA_PATH}"
+    -d "${dataset}"
+    --split "${SPLIT}"
+    --model_name "llama2-chat-hf"
+    --model_path "${LLAMA_MODEL_PATH}"
+    --max_new_tokens "${MAX_NEW_TOKENS}"
+    --prompt_path "${PROMPT_PATH}"
+    --predict_path "${run_pred_root}"
+    --add_rule
+    --rule_path "${run_rule_path}"
+    --force
+  )
+  cmd+=("${PREDICT_EXTRA_ARGS_ARR[@]}")
+  "${cmd[@]}"
+
+  local eval_file
+  eval_file="$(find "${run_pred_root}/${dataset}/llama2-chat-hf/${SPLIT}" -name 'eval_result.txt' | head -n 1)"
+  if [[ -z "${eval_file}" ]]; then
+    echo "ERROR: eval_result.txt not found for ${dataset}/${variant}" >&2
+    exit 1
+  fi
+  local metrics
+  metrics="$(cat "${eval_file}")"
+  echo -e "${RUN_ID}\t${dataset}\t${variant}\t${planning_model}\t${rule_nonempty_pct}\t${run_rule_path}\t${eval_file}\t${metrics}" >> "${SUMMARY_FILE}"
+}
+
+for DATASET in "${DATASETS[@]}"; do
+  for VARIANT in "${VARIANTS[@]}"; do
+    if [[ "${VARIANT}" == "llama_planning_llama_reasoning" ]]; then
+      PLANNING_MODEL_NAME="llama2-chat-hf"
+      PLANNING_MODEL_PATH="${LLAMA_MODEL_PATH}"
+    else
+      PLANNING_MODEL_NAME="RoG"
+      PLANNING_MODEL_PATH="${ROG_MODEL_PATH}"
+    fi
+
+    echo "=== [${DATASET}] planning for ${VARIANT} with ${PLANNING_MODEL_NAME} ==="
+    python src/qa_prediction/gen_rule_path.py \
+      --data_path "${DATA_PATH}" \
+      -d "${DATASET}" \
+      --split "${SPLIT}" \
+      --model_name "${PLANNING_MODEL_NAME}" \
+      --model_path "${PLANNING_MODEL_PATH}" \
+      --n_beam "${N_BEAM}" \
+      --output_path "${GEN_ROOT}/${VARIANT}" \
+      --force \
+      "${GEN_EXTRA_ARGS_ARR[@]}"
+
+    RULE_PATH="${GEN_ROOT}/${VARIANT}/${DATASET}/${PLANNING_MODEL_NAME}/${SPLIT}/predictions_${N_BEAM}_False.jsonl"
+    if [[ ! -f "${RULE_PATH}" ]]; then
+      echo "ERROR: missing rule file: ${RULE_PATH}" >&2
+      exit 1
+    fi
+    RULE_NONEMPTY_PCT="$(
+      python - <<'PY' "${RULE_PATH}"
+import json, sys
+p = sys.argv[1]
+total = 0
+nonempty = 0
+with open(p, "r") as f:
+    for line in f:
+        data = json.loads(line)
+        total += 1
+        if data.get("prediction"):
+            nonempty += 1
+print(0 if total == 0 else round(nonempty * 100 / total, 2))
+PY
+    )"
+
+    echo "=== [${DATASET}] reasoning for ${VARIANT} with llama2-chat-hf (rule_nonempty=${RULE_NONEMPTY_PCT}%) ==="
+    run_predict "${DATASET}" "${VARIANT}" "${PLANNING_MODEL_NAME}" "${RULE_NONEMPTY_PCT}" "${RULE_PATH}"
+  done
+done
+
+echo "Done. Summary saved to: ${SUMMARY_FILE}"
