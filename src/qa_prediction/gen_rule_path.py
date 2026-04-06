@@ -5,7 +5,6 @@ import os
 sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/..")
 import argparse
 import utils
-from datasets import load_dataset
 import datasets
 
 datasets.disable_progress_bar()
@@ -51,13 +50,16 @@ def parse_prediction(prediction):
     """
     results = []
     for p in prediction:
-        path = re.search(PATH_RE, p)
-        if path is None:
-            continue
-        path = path.group(1)
-        path = path.split("<SEP>")
-        if len(path) == 0:
-            continue
+        raw_path = p.strip()
+        path = re.search(PATH_RE, raw_path)
+        if path is not None:
+            raw_path = path.group(1)
+        else:
+            raw_path = raw_path.replace("<PATH>", "").replace("</PATH>", "")
+            if raw_path.startswith("<SEP>"):
+                raw_path = raw_path[len("<SEP>") :]
+
+        path = re.split(r"<SEP>|<pad>", raw_path)
         rules = []
         for rel in path:
             rel = rel.strip()
@@ -84,9 +86,20 @@ def generate_seq(
         output_scores=True,
         max_new_tokens=max_new_tokens,
     )
-    prediction = tokenizer.batch_decode(
-        output.sequences[:, input_ids.shape[1] :], skip_special_tokens=True
-    )
+    generated_ids = output.sequences[:, input_ids.shape[1] :]
+    try:
+        prediction = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    except IndexError as e:
+        if "piece id is out of range" not in str(e):
+            raise
+        tokenizer_name = getattr(tokenizer, "name_or_path", None)
+        if tokenizer_name is None:
+            raise
+        tokenizer_kwargs = {"use_fast": True}
+        if os.path.isdir(tokenizer_name):
+            tokenizer_kwargs["local_files_only"] = True
+        fast_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
+        prediction = fast_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
     prediction = [p.strip() for p in prediction]
 
     if num_beam > 1:
@@ -107,19 +120,23 @@ def gen_prediction(args):
             args.model_path, device_map="auto", torch_dtype=torch.bfloat16
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
+        model_kwargs = dict(
+            pretrained_model_name_or_path=args.model_path,
             device_map="auto",
             torch_dtype=torch.float16,
-            use_auth_token=True,
         )
+        if os.path.isdir(args.model_path):
+            model_kwargs["local_files_only"] = True
+        else:
+            model_kwargs["use_auth_token"] = True
+        model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
 
     input_file = os.path.join(args.data_path, args.d)
     output_dir = os.path.join(args.output_path, args.d, args.model_name, args.split)
     print("Save results to: ", output_dir)
 
     # Load dataset
-    dataset = load_dataset(input_file, split=args.split)
+    dataset = utils.load_qa_dataset(args.data_path, args.d, args.split)
 
     # Load prompt template
     prompter = utils.InstructFormater(args.prompt_path)
