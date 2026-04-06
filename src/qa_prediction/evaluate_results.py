@@ -39,13 +39,22 @@ def eval_hit(prediction, answer):
 def eval_f1(prediction, answer):
     if len(prediction) == 0:
         return 0, 0, 0
-    matched = 0
-    prediction_str = ' '.join(prediction)
+    matched_prediction = 0
+    for p in prediction:
+        for a in answer:
+            if match(p, a):
+                matched_prediction += 1
+                break
+
+    matched_answer = 0
     for a in answer:
-        if match(prediction_str, a):
-            matched += 1
-    precision = matched / len(prediction)
-    recall = matched / len(answer)
+        for p in prediction:
+            if match(p, a):
+                matched_answer += 1
+                break
+
+    precision = matched_prediction / len(prediction)
+    recall = matched_answer / len(answer)
     if precision + recall == 0:
         return 0, precision, recall
     else:
